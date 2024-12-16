@@ -1,0 +1,1 @@
+CLI7 Total anagrams: 2432902008176640000

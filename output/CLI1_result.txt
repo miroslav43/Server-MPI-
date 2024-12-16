@@ -1,1 +1,1 @@
-Total anagrams: 5040
+CLI1 Total anagrams: 5040

@@ -8,6 +8,7 @@ SRC_DIR = src
 INC_DIR = include
 OBJ_DIR = obj
 BIN_DIR = bin
+OUT_DIR = output
 
 # Ensure directories exist
 $(shell mkdir -p $(OBJ_DIR))
@@ -56,4 +57,10 @@ $(BIN_DIR)/$(PROGRAM): $(MAIN_OBJ) $(WORKER_OBJ) $(UTILS_OBJ) $(COMANDS_OBJ)
 # Clean up
 clean:
 	rm -f $(OBJ_DIR)/*.o
-	rm -f $(BIN_DIR)/$(PROGRAM)
+	rm -f $(BIN_DIR)/$(PROGRAM)\
+
+oclean:
+	rm -f $(OUT_DIR)/*result.txt
+
+run:
+	mpirun -np 4 $(BIN_DIR)/$(PROGRAM) comand_file.txt	

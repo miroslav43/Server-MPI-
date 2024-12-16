@@ -1,4 +1,0 @@
-[02:21:13] Received command from CLI0: PRIMEDIVISORS 452876
-[02:21:13] Dispatched job to worker 1
-[02:21:13] Received command from CLI1: ANAGRAMS tralala
-[02:21:13] A job finished, freeing worker 1. Result: CLI0 3

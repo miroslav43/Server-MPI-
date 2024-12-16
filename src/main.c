@@ -1,43 +1,70 @@
+//FILE main.c
 #include "common.h"
 #include "utils.h"
 #include "comands.h"
-#include <unistd.h>
-#include <errno.h>
 
-// Prototypes
+// Function prototypes
 void log_event(FILE *logf, const char *event);
 void main_server(int size, const char *cmd_file);
+int find_free_worker(int world_size, int *worker_free);
+int poll_for_result();
+void receive_worker_result(int world_size, int *worker_free, FILE *log, int *commands_received, FILE *f);
+void write_csv(const char *filename, CommandInfo *tasks, int total_commands);
+
+// We'll maintain a queue of indices for commands that have been dispatched and are waiting for results
+// A simple dynamic array can work as a queue here.
+typedef struct
+{
+    int *data;
+    int front;
+    int rear;
+    int capacity;
+} IntQueue;
+
+void init_queue(IntQueue *q, int capacity)
+{
+    q->data = (int *)malloc(capacity * sizeof(int));
+    q->front = 0;
+    q->rear = 0;
+    q->capacity = capacity;
+}
+
+void enqueue(IntQueue *q, int val)
+{
+    q->data[q->rear++] = val;
+}
+
+int dequeue(IntQueue *q)
+{
+    return q->data[q->front++];
+}
+
+int queue_empty(IntQueue *q)
+{
+    return q->front == q->rear;
+}
 
 int main(int argc, char *argv[])
 {
     MPI_Init(&argc, &argv);
-
-    int size, rank;
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    int world_size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    if (size < 2)
+    if (argc < 2 && rank == 0)
     {
-        if (rank == 0)
-        {
-            fprintf(stderr, "Need at least 2 processes\n");
-        }
-        MPI_Finalize();
-        return 1;
+        fprintf(stderr, "Usage: %s command_file\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     if (rank == 0)
     {
-        if (argc < 2)
-        {
-            fprintf(stderr, "Usage: %s command_file\n", argv[0]);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        main_server(size, argv[1]);
+        // This is the main server
+        main_server(world_size, argv[1]); // Pass command_file as argument
     }
     else
     {
-        extern void worker_process(int rank);
+        // This is a worker
         worker_process(rank);
     }
 
@@ -53,179 +80,244 @@ void log_event(FILE *logf, const char *event)
     fflush(logf);
 }
 
-void main_server(int size, const char *cmd_file)
+int find_free_worker(int world_size, int *worker_free)
 {
-    FILE *f = fopen(cmd_file, "r");
+    for (int i = 1; i < world_size; i++)
+    {
+        if (worker_free[i] == 1)
+            return i;
+    }
+    return -1;
+}
+
+int poll_for_result()
+{
+    int flag;
+    MPI_Status status;
+    MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &flag, &status);
+    return flag;
+}
+
+// We'll define a global pointer to tasks and related data here for simplicity.
+// Alternatively, you can pass these as parameters.
+static CommandInfo *tasks = NULL;
+static IntQueue waiting_commands;
+
+void receive_worker_result(int world_size, int *worker_free, FILE *log, int *commands_received, FILE *f)
+{
+    MPI_Status status;
+    char result[1024];
+    MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
+
+    // Get the index of the command that just completed from the queue
+    int cmd_index = dequeue(&waiting_commands);
+
+    // Parse client_id from the result to confirm correctness
+    char client_id[64];
+    char *space = strchr(result, ' ');
+    if (space != NULL)
+    {
+        int len = (int)(space - result);
+        strncpy(client_id, result, len);
+        client_id[len] = '\0';
+    }
+    else
+    {
+        // Malformed result or error line, still proceed
+        strcpy(client_id, "UNKNOWN");
+    }
+
+    // Write to client's result file
+    char filename[256];
+    sprintf(filename, "output/%s_result.txt", client_id);
+    FILE *cf = fopen(filename, "a");
+    if (cf)
+    {
+        fprintf(cf, "%s\n", result);
+        fclose(cf);
+    }
+
+    double completion_time = MPI_Wtime();
+    tasks[cmd_index].completion_time = completion_time;
+    fprintf(log, "COMPLETED: %s TIME: %f\n", client_id, completion_time);
+
+    // Mark worker as free
+    worker_free[status.MPI_SOURCE] = 1;
+    (*commands_received)++;
+}
+
+void main_server(int world_size, const char *command_file)
+{
+    // Create output directory if not exists
+    mkdir("output", 0777);
+
+    // Open command file
+    FILE *f = fopen(command_file, "r");
     if (!f)
     {
-        perror("Could not open command file");
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        fprintf(stderr, "Error opening command file\n");
+        return;
     }
 
-    FILE *logf = fopen("server_log.txt", "w");
-    if (!logf)
+    // Open server_log file
+    FILE *log = fopen("output/server_log.txt", "w");
+    if (!log)
     {
-        perror("Cannot open log file");
+        fprintf(stderr, "Error opening log file\n");
         fclose(f);
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        return;
     }
 
-    // Create the output folder if it doesn't exist
-    if (mkdir("output", 0777) && errno != EEXIST)
+    // Track worker availability
+    int worker_free[world_size];
+    for (int i = 1; i < world_size; i++)
     {
-        perror("Error creating output directory");
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        worker_free[i] = 1;
     }
 
-    int *workers_free = malloc((size - 1) * sizeof(int));
-    for (int i = 0; i < size - 1; i++)
-        workers_free[i] = 1;
+    char line[1024];
+    int commands_sent = 0;
+    int commands_received = 0;
+    int total_commands = 0;
 
-    int active_jobs = 0;
-    char line[CMD_LEN];
-    MPI_Status status;
-
-    // Track which CLI commands have been processed
-    int processed_cli[100] = {0}; // Assume at most 100 CLI commands
-
-    while (fgets(line, CMD_LEN, f))
+    // Count total commands
+    fseek(f, 0, SEEK_SET);
+    while (fgets(line, sizeof(line), f))
     {
-        line[strcspn(line, "\n")] = '\0'; // Strip newline
+        if (strncmp(line, "CLI", 3) == 0)
+            total_commands++;
+    }
+    fseek(f, 0, SEEK_SET);
 
+    // Allocate memory for tasks
+    if (total_commands > 0)
+    {
+        tasks = (CommandInfo *)malloc(total_commands * sizeof(CommandInfo));
+    }
+
+    init_queue(&waiting_commands, total_commands);
+
+    int cmd_index = 0; // Index for storing command info
+
+    // Main loop to read commands
+    while (fgets(line, sizeof(line), f))
+    {
         char client_id[64], command[64], arg[512];
-        if (parse_command_line(line, client_id, command, arg) != 0)
+        if (strncmp(line, "WAIT", 4) == 0)
         {
-            // Malformed line or unknown format
-            continue;
-        }
-
-        if (strncmp(client_id, "CLI", 3) == 0)
-        {
-            // Mark CLI command as seen
-            int cli_id = atoi(client_id + 3);
-            processed_cli[cli_id] = 1;
-        }
-
-        if (strcmp(command, "WAIT") == 0)
-        {
-            log_event(logf, "Main server received WAIT command");
-            int wait_time = atoi(arg);
-            sleep(wait_time);
-            continue;
-        }
-
-        // Log received command
-        char event_msg[256];
-        snprintf(event_msg, sizeof(event_msg), "Received command from %s: %s %s", client_id, command, arg);
-        log_event(logf, event_msg);
-
-        // Check if any worker finished before dispatching a new one
-        while (1)
-        {
-            int flag;
-            MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &flag, &status);
-            if (!flag)
-                break;
-
-            char result[1024];
-            MPI_Recv(result, 1024, MPI_CHAR, status.MPI_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
-            workers_free[status.MPI_SOURCE - 1] = 1;
-            active_jobs--;
-
-            snprintf(event_msg, sizeof(event_msg), "Result received from worker %d: %s", status.MPI_SOURCE, result);
-            log_event(logf, event_msg);
-
-            char res_client_id[64];
-            char res_output[512];
-            sscanf(result, "%s %[^\n]", res_client_id, res_output);
-
-            char res_filename[128];
-            snprintf(res_filename, sizeof(res_filename), "output/%s_result.txt", res_client_id);
-            FILE *rf = fopen(res_filename, "a");
-            if (rf)
+            int wait_time;
+            if (sscanf(line, "WAIT %d", &wait_time) == 1)
             {
-                fprintf(rf, "%s\n", res_output);
-                fclose(rf);
+                sleep(wait_time);
+            }
+        }
+        else
+        {
+            // Parse command line
+            if (parse_command_line(line, client_id, command, arg) == 0)
+            {
+                // Record arrival time
+                double arrival_time = MPI_Wtime();
+
+                // Store command info
+                if (cmd_index < total_commands)
+                {
+                    strncpy(tasks[cmd_index].client_id, client_id, sizeof(tasks[cmd_index].client_id));
+                    strncpy(tasks[cmd_index].command, command, sizeof(tasks[cmd_index].command));
+                    strncpy(tasks[cmd_index].arg, arg, sizeof(tasks[cmd_index].arg));
+                    tasks[cmd_index].arrival_time = arrival_time;
+                    tasks[cmd_index].dispatch_time = 0.0;
+                    tasks[cmd_index].completion_time = 0.0;
+                }
+
+                fprintf(log, "ARRIVED: %s COMMAND: %s ARG: %s TIME: %f\n", client_id, command, arg, arrival_time);
+
+                // Ensure we have a free worker
+                int free_worker = -1;
+                while (free_worker == -1)
+                {
+                    free_worker = find_free_worker(world_size, worker_free);
+                    if (free_worker == -1)
+                    {
+                        // Wait for a result to free a worker
+                        receive_worker_result(world_size, worker_free, log, &commands_received, f);
+                    }
+                }
+
+                // We now have a free worker
+                worker_free[free_worker] = 0; // Mark as busy
+
+                // Send command to worker
+                double dispatch_time = MPI_Wtime();
+                tasks[cmd_index].dispatch_time = dispatch_time;
+                MPI_Send(line, (int)strlen(line) + 1, MPI_CHAR, free_worker, TAG_WORK, MPI_COMM_WORLD);
+                fprintf(log, "DISPATCHED: %s TO: %d TIME: %f\n", client_id, free_worker, dispatch_time);
+
+                // Add this command to the queue of waiting results
+                enqueue(&waiting_commands, cmd_index);
+
+                cmd_index++;
+                commands_sent++;
+            }
+            else
+            {
+                // Malformed command
+                fprintf(log, "ERROR: Malformed command: %s\n", line);
             }
         }
 
-        int free_worker = -1;
-        for (int i = 0; i < size - 1; i++)
+        // Continuously check for results
+        while (poll_for_result())
         {
-            if (workers_free[i])
-            {
-                free_worker = i + 1;
-                break;
-            }
+            receive_worker_result(world_size, worker_free, log, &commands_received, f);
         }
-
-        if (free_worker == -1)
-        {
-            char result[1024];
-            MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
-            workers_free[status.MPI_SOURCE - 1] = 1;
-            active_jobs--;
-
-            snprintf(event_msg, sizeof(event_msg), "A job finished, freeing worker %d. Result: %s", status.MPI_SOURCE, result);
-            log_event(logf, event_msg);
-        }
-
-        workers_free[free_worker - 1] = 0;
-        MPI_Send(line, (int)strlen(line) + 1, MPI_CHAR, free_worker, TAG_CMD, MPI_COMM_WORLD);
-        active_jobs++;
-
-        snprintf(event_msg, sizeof(event_msg), "Dispatched job to worker %d", free_worker);
-        log_event(logf, event_msg);
     }
 
-    // Wait for all jobs to finish
-    while (active_jobs > 0)
+    // After finishing reading the file, wait for all outstanding results
+    while (commands_received < total_commands)
     {
-        char result[1024];
-        MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
-        workers_free[status.MPI_SOURCE - 1] = 1;
-        active_jobs--;
-
-        char event_msg[256];
-        snprintf(event_msg, sizeof(event_msg), "Final cleanup: job finished from worker %d: %s", status.MPI_SOURCE, result);
-        log_event(logf, event_msg);
-
-        char res_client_id[64];
-        char res_output[512];
-        sscanf(result, "%s %[^\n]", res_client_id, res_output);
-
-        char res_filename[128];
-        snprintf(res_filename, sizeof(res_filename), "output/%s_result.txt", res_client_id);
-        FILE *rf = fopen(res_filename, "a");
-        if (rf)
-        {
-            fprintf(rf, "%s\n", res_output);
-            fclose(rf);
-        }
+        receive_worker_result(world_size, worker_free, log, &commands_received, f);
     }
 
-    // Ensure all CLI commands generate result files
-    for (int i = 0; i < 100; i++)
-    {
-        if (processed_cli[i])
-        {
-            char res_filename[128];
-            snprintf(res_filename, sizeof(res_filename), "output/CLI%d_result.txt", i);
-            FILE *rf = fopen(res_filename, "a");
-            if (rf)
-            {
-                fclose(rf); // Create empty file if it doesn't exist
-            }
-        }
-    }
-
-    // Stop workers
-    for (int i = 1; i < size; i++)
+    // Send stop signal to workers
+    for (int i = 1; i < world_size; i++)
     {
         MPI_Send(NULL, 0, MPI_CHAR, i, TAG_STOP, MPI_COMM_WORLD);
     }
 
     fclose(f);
-    fclose(logf);
-    free(workers_free);
+    fclose(log);
+
+    // Write CSV file with measurements
+    if (total_commands > 0)
+    {
+        write_csv("output/tasks.csv", tasks, total_commands);
+        free(tasks);
+    }
+    free(waiting_commands.data);
+}
+
+void write_csv(const char *filename, CommandInfo *tasks, int total_commands)
+{
+    FILE *csv = fopen(filename, "w");
+    if (!csv)
+    {
+        fprintf(stderr, "Error: Could not open %s for writing CSV.\n", filename);
+        return;
+    }
+    // CSV Header
+    fprintf(csv, "client_id,command,arg,arrival_time,dispatch_time,completion_time,total_time\n");
+    for (int i = 0; i < total_commands; i++)
+    {
+        double total_time = tasks[i].completion_time - tasks[i].arrival_time;
+        fprintf(csv, "%s,%s,%s,%f,%f,%f,%f\n",
+                tasks[i].client_id,
+                tasks[i].command,
+                tasks[i].arg,
+                tasks[i].arrival_time,
+                tasks[i].dispatch_time,
+                tasks[i].completion_time,
+                total_time);
+    }
+    fclose(csv);
 }
