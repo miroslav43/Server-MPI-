@@ -1,25 +1,6 @@
-//FILE main.c
 #include "common.h"
 #include "utils.h"
 #include "comands.h"
-
-// Function prototypes
-void log_event(FILE *logf, const char *event);
-void main_server(int size, const char *cmd_file);
-int find_free_worker(int world_size, int *worker_free);
-int poll_for_result();
-void receive_worker_result(int world_size, int *worker_free, FILE *log, int *commands_received, FILE *f);
-void write_csv(const char *filename, CommandInfo *tasks, int total_commands);
-
-// We'll maintain a queue of indices for commands that have been dispatched and are waiting for results
-// A simple dynamic array can work as a queue here.
-typedef struct
-{
-    int *data;
-    int front;
-    int rear;
-    int capacity;
-} IntQueue;
 
 void init_queue(IntQueue *q, int capacity)
 {
@@ -31,12 +12,17 @@ void init_queue(IntQueue *q, int capacity)
 
 void enqueue(IntQueue *q, int val)
 {
-    q->data[q->rear++] = val;
+    if (q->rear < q->capacity)
+    {
+        q->data[q->rear++] = val;
+    }
 }
 
 int dequeue(IntQueue *q)
 {
-    return q->data[q->front++];
+    if (q->front < q->rear)
+        return q->data[q->front++];
+    return -1;
 }
 
 int queue_empty(IntQueue *q)
@@ -59,12 +45,10 @@ int main(int argc, char *argv[])
 
     if (rank == 0)
     {
-        // This is the main server
-        main_server(world_size, argv[1]); // Pass command_file as argument
+        main_server(world_size, argv[1]);
     }
     else
     {
-        // This is a worker
         worker_process(rank);
     }
 
@@ -98,203 +82,268 @@ int poll_for_result()
     return flag;
 }
 
-// We'll define a global pointer to tasks and related data here for simplicity.
-// Alternatively, you can pass these as parameters.
-static CommandInfo *tasks = NULL;
-static IntQueue waiting_commands;
-
 void receive_worker_result(int world_size, int *worker_free, FILE *log, int *commands_received, FILE *f)
 {
     MPI_Status status;
-    char result[1024];
-    MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
+    char header[1024];
+    MPI_Recv(header, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
 
-    // Get the index of the command that just completed from the queue
     int cmd_index = dequeue(&waiting_commands);
-
-    // Parse client_id from the result to confirm correctness
-    char client_id[64];
-    char *space = strchr(result, ' ');
-    if (space != NULL)
+    if (cmd_index < 0)
     {
-        int len = (int)(space - result);
-        strncpy(client_id, result, len);
-        client_id[len] = '\0';
-    }
-    else
-    {
-        // Malformed result or error line, still proceed
-        strcpy(client_id, "UNKNOWN");
+        fprintf(log, "ERROR: Received a result but no command is waiting.\n");
+        fflush(log);
+        worker_free[status.MPI_SOURCE] = 1;
+        return;
     }
 
-    // Write to client's result file
+    char client_id[64] = "UNKNOWN";
+    {
+        char *space = strchr(header, ' ');
+        if (space != NULL)
+        {
+            int len = (int)(space - header);
+            if (len > 63)
+                len = 63;
+            strncpy(client_id, header, len);
+            client_id[len] = '\0';
+        }
+    }
+
     char filename[256];
     sprintf(filename, "output/%s_result.txt", client_id);
     FILE *cf = fopen(filename, "a");
-    if (cf)
+    if (!cf)
     {
-        fprintf(cf, "%s\n", result);
-        fclose(cf);
+        fprintf(log, "ERROR: Could not open %s for writing result.\n", filename);
+        fflush(log);
+        worker_free[status.MPI_SOURCE] = 1;
+        (*commands_received)++;
+        return;
     }
+
+    if (strstr(header, "MATRIXRESULT") != NULL)
+    {
+        char dummy[64];
+        int N, start_row, end_row;
+        if (sscanf(header, "%s MATRIXRESULT %d %d %d", dummy, &N, &start_row, &end_row) == 4)
+        {
+            int rows = end_row - start_row;
+            float *C_data = (float *)malloc(rows * N * sizeof(float));
+            if (!C_data)
+            {
+                fprintf(log, "ERROR: Memory allocation failed for receiving matrix data.\n");
+                fflush(log);
+                fclose(cf);
+                worker_free[status.MPI_SOURCE] = 1;
+                (*commands_received)++;
+                return;
+            }
+
+            MPI_Status mat_status;
+            MPI_Recv(C_data, rows * N, MPI_FLOAT, status.MPI_SOURCE, TAG_MATRIX_RESULT, MPI_COMM_WORLD, &mat_status);
+
+            for (int i = 0; i < rows; i++)
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    fprintf(cf, "%f%c", C_data[i * N + j], (j == N - 1) ? '\n' : ' ');
+                }
+            }
+
+            free(C_data);
+        }
+        else
+        {
+            fprintf(log, "ERROR: Malformed matrix result header: %s\n", header);
+            fflush(log);
+        }
+    }
+    else
+    {
+        fprintf(cf, "%s\n", header);
+    }
+
+    fclose(cf);
 
     double completion_time = MPI_Wtime();
     tasks[cmd_index].completion_time = completion_time;
     fprintf(log, "COMPLETED: %s TIME: %f\n", client_id, completion_time);
+    fflush(log);
 
-    // Mark worker as free
     worker_free[status.MPI_SOURCE] = 1;
     (*commands_received)++;
 }
 
-void main_server(int world_size, const char *command_file)
+static void handle_parallel_matrix(FILE *log, const char *client_id, const char *command, int N,
+                                   const char *f1, const char *f2, int world_size, int *worker_free,
+                                   int *commands_received, FILE *f, int cmd_index)
 {
-    // Create output directory if not exists
-    mkdir("output", 0777);
-
-    // Open command file
-    FILE *f = fopen(command_file, "r");
-    if (!f)
+    float **A = read_matrix(f1, N);
+    float **B = read_matrix(f2, N);
+    if (!A || !B)
     {
-        fprintf(stderr, "Error opening command file\n");
+        fprintf(log, "ERROR: Could not read matrix files %s or %s\n", f1, f2);
+        fflush(log);
+        if (A)
+            free_matrix(A, N);
+        if (B)
+            free_matrix(B, N);
         return;
     }
 
-    // Open server_log file
-    FILE *log = fopen("output/server_log.txt", "w");
-    if (!log)
+    int num_workers = world_size - 1;
+    if (num_workers <= 0)
     {
-        fprintf(stderr, "Error opening log file\n");
-        fclose(f);
+        fprintf(log, "ERROR: No workers available for parallel matrix.\n");
+        fflush(log);
+        free_matrix(A, N);
+        free_matrix(B, N);
         return;
     }
 
-    // Track worker availability
-    int worker_free[world_size];
-    for (int i = 1; i < world_size; i++)
+    int rows_per_worker = N / num_workers;
+    int remainder = N % num_workers;
+
+    double dispatch_time = MPI_Wtime();
+    tasks[cmd_index].dispatch_time = dispatch_time;
+
+    int start_row = 0;
+    for (int w = 1; w <= num_workers; w++)
     {
-        worker_free[i] = 1;
-    }
+        int end_row = start_row + rows_per_worker + (w == num_workers ? remainder : 0);
+        if (end_row > N)
+            end_row = N;
 
-    char line[1024];
-    int commands_sent = 0;
-    int commands_received = 0;
-    int total_commands = 0;
-
-    // Count total commands
-    fseek(f, 0, SEEK_SET);
-    while (fgets(line, sizeof(line), f))
-    {
-        if (strncmp(line, "CLI", 3) == 0)
-            total_commands++;
-    }
-    fseek(f, 0, SEEK_SET);
-
-    // Allocate memory for tasks
-    if (total_commands > 0)
-    {
-        tasks = (CommandInfo *)malloc(total_commands * sizeof(CommandInfo));
-    }
-
-    init_queue(&waiting_commands, total_commands);
-
-    int cmd_index = 0; // Index for storing command info
-
-    // Main loop to read commands
-    while (fgets(line, sizeof(line), f))
-    {
-        char client_id[64], command[64], arg[512];
-        if (strncmp(line, "WAIT", 4) == 0)
+        int free_worker = -1;
+        while (free_worker == -1)
         {
-            int wait_time;
-            if (sscanf(line, "WAIT %d", &wait_time) == 1)
+            free_worker = find_free_worker(world_size, worker_free);
+            if (free_worker == -1)
             {
-                sleep(wait_time);
-            }
-        }
-        else
-        {
-            // Parse command line
-            if (parse_command_line(line, client_id, command, arg) == 0)
-            {
-                // Record arrival time
-                double arrival_time = MPI_Wtime();
-
-                // Store command info
-                if (cmd_index < total_commands)
+                while (poll_for_result())
                 {
-                    strncpy(tasks[cmd_index].client_id, client_id, sizeof(tasks[cmd_index].client_id));
-                    strncpy(tasks[cmd_index].command, command, sizeof(tasks[cmd_index].command));
-                    strncpy(tasks[cmd_index].arg, arg, sizeof(tasks[cmd_index].arg));
-                    tasks[cmd_index].arrival_time = arrival_time;
-                    tasks[cmd_index].dispatch_time = 0.0;
-                    tasks[cmd_index].completion_time = 0.0;
+                    receive_worker_result(world_size, worker_free, log, commands_received, f);
                 }
-
-                fprintf(log, "ARRIVED: %s COMMAND: %s ARG: %s TIME: %f\n", client_id, command, arg, arrival_time);
-
-                // Ensure we have a free worker
-                int free_worker = -1;
-                while (free_worker == -1)
-                {
-                    free_worker = find_free_worker(world_size, worker_free);
-                    if (free_worker == -1)
-                    {
-                        // Wait for a result to free a worker
-                        receive_worker_result(world_size, worker_free, log, &commands_received, f);
-                    }
-                }
-
-                // We now have a free worker
-                worker_free[free_worker] = 0; // Mark as busy
-
-                // Send command to worker
-                double dispatch_time = MPI_Wtime();
-                tasks[cmd_index].dispatch_time = dispatch_time;
-                MPI_Send(line, (int)strlen(line) + 1, MPI_CHAR, free_worker, TAG_WORK, MPI_COMM_WORLD);
-                fprintf(log, "DISPATCHED: %s TO: %d TIME: %f\n", client_id, free_worker, dispatch_time);
-
-                // Add this command to the queue of waiting results
-                enqueue(&waiting_commands, cmd_index);
-
-                cmd_index++;
-                commands_sent++;
-            }
-            else
-            {
-                // Malformed command
-                fprintf(log, "ERROR: Malformed command: %s\n", line);
             }
         }
 
-        // Continuously check for results
-        while (poll_for_result())
+        worker_free[free_worker] = 0;
+
+        char sub_cmd[CMD_LEN];
+        sprintf(sub_cmd, "%s %s %d %d %d", client_id, command, N, start_row, end_row);
+        MPI_Send(sub_cmd, (int)strlen(sub_cmd) + 1, MPI_CHAR, free_worker, TAG_MATRIX_TASK, MPI_COMM_WORLD);
+
+        int chunk_rows = end_row - start_row;
+        float *A_data = (float *)malloc(chunk_rows * N * sizeof(float));
+        float *B_data = (float *)malloc(chunk_rows * N * sizeof(float));
+
+        if (!A_data || !B_data)
         {
-            receive_worker_result(world_size, worker_free, log, &commands_received, f);
+            fprintf(log, "ERROR: Memory allocation failed for parallel matrix data.\n");
+            fflush(log);
+            if (A_data)
+                free(A_data);
+            if (B_data)
+                free(B_data);
+            free_matrix(A, N);
+            free_matrix(B, N);
+            return;
+        }
+
+        for (int i = 0; i < chunk_rows; i++)
+        {
+            for (int j = 0; j < N; j++)
+            {
+                A_data[i * N + j] = A[start_row + i][j];
+                B_data[i * N + j] = B[start_row + i][j];
+            }
+        }
+
+        MPI_Send(A_data, chunk_rows * N, MPI_FLOAT, free_worker, TAG_MATRIX_TASK, MPI_COMM_WORLD);
+        MPI_Send(B_data, chunk_rows * N, MPI_FLOAT, free_worker, TAG_MATRIX_TASK, MPI_COMM_WORLD);
+
+        free(A_data);
+        free(B_data);
+
+        enqueue(&waiting_commands, cmd_index);
+
+        start_row = end_row;
+    }
+
+    free_matrix(A, N);
+    free_matrix(B, N);
+}
+
+static void handle_single_worker_matrix(FILE *log, const char *client_id, const char *command, int N,
+                                        const char *f1, const char *f2, int world_size, int *worker_free,
+                                        int *commands_received, FILE *f, int cmd_index)
+{
+    float **A = read_matrix(f1, N);
+    float **B = read_matrix(f2, N);
+    if (!A || !B)
+    {
+        fprintf(log, "ERROR: Could not read matrix files %s or %s\n", f1, f2);
+        fflush(log);
+        if (A)
+            free_matrix(A, N);
+        if (B)
+            free_matrix(B, N);
+        return;
+    }
+
+    int free_worker = -1;
+    while (free_worker == -1)
+    {
+        free_worker = find_free_worker(world_size, worker_free);
+        if (free_worker == -1)
+        {
+            while (poll_for_result())
+            {
+                receive_worker_result(world_size, worker_free, log, commands_received, f);
+            }
         }
     }
+    worker_free[free_worker] = 0;
 
-    // After finishing reading the file, wait for all outstanding results
-    while (commands_received < total_commands)
+    char fake_line[CMD_LEN];
+    sprintf(fake_line, "%s %s %d %s %s", client_id, command, N, f1, f2);
+    double dispatch_time = MPI_Wtime();
+    tasks[cmd_index].dispatch_time = dispatch_time;
+    MPI_Send(fake_line, (int)strlen(fake_line) + 1, MPI_CHAR, free_worker, TAG_WORK, MPI_COMM_WORLD);
+
+    float *A_data = (float *)malloc(N * N * sizeof(float));
+    float *B_data = (float *)malloc(N * N * sizeof(float));
+    if (!A_data || !B_data)
     {
-        receive_worker_result(world_size, worker_free, log, &commands_received, f);
+        fprintf(log, "ERROR: Memory allocation failed for single-worker matrix data.\n");
+        fflush(log);
+        if (A_data)
+            free(A_data);
+        if (B_data)
+            free(B_data);
+        free_matrix(A, N);
+        free_matrix(B, N);
+        return;
     }
 
-    // Send stop signal to workers
-    for (int i = 1; i < world_size; i++)
+    for (int i = 0; i < N; i++)
     {
-        MPI_Send(NULL, 0, MPI_CHAR, i, TAG_STOP, MPI_COMM_WORLD);
+        for (int j = 0; j < N; j++)
+        {
+            A_data[i * N + j] = A[i][j];
+            B_data[i * N + j] = B[i][j];
+        }
     }
+    MPI_Send(A_data, N * N, MPI_FLOAT, free_worker, TAG_WORK, MPI_COMM_WORLD);
+    MPI_Send(B_data, N * N, MPI_FLOAT, free_worker, TAG_WORK, MPI_COMM_WORLD);
 
-    fclose(f);
-    fclose(log);
+    free(A_data);
+    free(B_data);
+    free_matrix(A, N);
+    free_matrix(B, N);
 
-    // Write CSV file with measurements
-    if (total_commands > 0)
-    {
-        write_csv("output/tasks.csv", tasks, total_commands);
-        free(tasks);
-    }
-    free(waiting_commands.data);
+    enqueue(&waiting_commands, cmd_index);
 }
 
 void write_csv(const char *filename, CommandInfo *tasks, int total_commands)
@@ -305,7 +354,6 @@ void write_csv(const char *filename, CommandInfo *tasks, int total_commands)
         fprintf(stderr, "Error: Could not open %s for writing CSV.\n", filename);
         return;
     }
-    // CSV Header
     fprintf(csv, "client_id,command,arg,arrival_time,dispatch_time,completion_time,total_time\n");
     for (int i = 0; i < total_commands; i++)
     {
@@ -320,4 +368,175 @@ void write_csv(const char *filename, CommandInfo *tasks, int total_commands)
                 total_time);
     }
     fclose(csv);
+}
+
+void main_server(int world_size, const char *command_file)
+{
+    mkdir("output", 0777);
+
+    FILE *f = fopen(command_file, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Error opening command file %s\n", command_file);
+        return;
+    }
+
+    FILE *log = fopen("output/server_log.txt", "w");
+    if (!log)
+    {
+        fprintf(stderr, "Error opening log file\n");
+        fclose(f);
+        return;
+    }
+
+    int worker_free[world_size];
+    for (int i = 1; i < world_size; i++)
+    {
+        worker_free[i] = 1;
+    }
+
+    int total_commands = 0;
+    char line[1024];
+    fseek(f, 0, SEEK_SET);
+    while (fgets(line, sizeof(line), f))
+    {
+        if (strncmp(line, "CLI", 3) == 0)
+            total_commands++;
+    }
+    fseek(f, 0, SEEK_SET);
+
+    if (total_commands > 0)
+    {
+        tasks = (CommandInfo *)malloc(total_commands * sizeof(CommandInfo));
+        if (!tasks)
+        {
+            fprintf(stderr, "Error allocating memory for tasks.\n");
+            fclose(f);
+            fclose(log);
+            return;
+        }
+    }
+
+    init_queue(&waiting_commands, total_commands);
+
+    int commands_sent = 0;
+    int commands_received = 0;
+    int cmd_index = 0;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        char client_id[64], command[64], arg[512];
+        if (strncmp(line, "WAIT", 4) == 0)
+        {
+            int wait_time;
+            if (sscanf(line, "WAIT %d", &wait_time) == 1)
+            {
+                sleep(wait_time);
+            }
+        }
+        else
+        {
+            if (parse_command_line(line, client_id, command, arg) == 0)
+            {
+                double arrival_time = MPI_Wtime();
+                if (cmd_index < total_commands)
+                {
+                    strncpy(tasks[cmd_index].client_id, client_id, sizeof(tasks[cmd_index].client_id));
+                    strncpy(tasks[cmd_index].command, command, sizeof(tasks[cmd_index].command));
+                    strncpy(tasks[cmd_index].arg, arg, sizeof(tasks[cmd_index].arg));
+                    tasks[cmd_index].arrival_time = arrival_time;
+                    tasks[cmd_index].dispatch_time = 0.0;
+                    tasks[cmd_index].completion_time = 0.0;
+                }
+
+                fprintf(log, "ARRIVED: %s COMMAND: %s ARG: %s TIME: %f\n", client_id, command, arg, arrival_time);
+                fflush(log);
+
+                if (strncmp(command, "MATRIX", 6) == 0)
+                {
+                    int N;
+                    char f1[256], f2[256];
+                    if (sscanf(arg, "%d %s %s", &N, f1, f2) != 3)
+                    {
+                        fprintf(log, "ERROR: Malformed MATRIX args: %s\n", arg);
+                        fflush(log);
+                    }
+                    else
+                    {
+                        if (N > MATRIX_THRESHOLD)
+                        {
+                            handle_parallel_matrix(log, client_id, command, N, f1, f2, world_size, worker_free, &commands_received, f, cmd_index);
+                        }
+                        else
+                        {
+                            handle_single_worker_matrix(log, client_id, command, N, f1, f2, world_size, worker_free, &commands_received, f, cmd_index);
+                        }
+                        commands_sent++;
+                        cmd_index++;
+                    }
+                }
+                else
+                {
+                    int free_worker = -1;
+                    while (free_worker == -1)
+                    {
+                        free_worker = find_free_worker(world_size, worker_free);
+                        if (free_worker == -1)
+                        {
+                            while (poll_for_result())
+                            {
+                                receive_worker_result(world_size, worker_free, log, &commands_received, f);
+                            }
+                        }
+                    }
+
+                    worker_free[free_worker] = 0;
+                    double dispatch_time = MPI_Wtime();
+                    if (cmd_index < total_commands)
+                        tasks[cmd_index].dispatch_time = dispatch_time;
+                    MPI_Send(line, (int)strlen(line) + 1, MPI_CHAR, free_worker, TAG_WORK, MPI_COMM_WORLD);
+
+                    fprintf(log, "DISPATCHED: %s TO: %d TIME: %f\n", client_id, free_worker, dispatch_time);
+                    fflush(log);
+
+                    enqueue(&waiting_commands, cmd_index);
+                    commands_sent++;
+                    cmd_index++;
+                }
+            }
+            else
+            {
+                fprintf(log, "ERROR: Malformed command: %s\n", line);
+                fflush(log);
+            }
+        }
+
+        while (poll_for_result())
+        {
+            receive_worker_result(world_size, worker_free, log, &commands_received, f);
+        }
+    }
+
+    while (commands_received < total_commands)
+    {
+        while (poll_for_result())
+        {
+            receive_worker_result(world_size, worker_free, log, &commands_received, f);
+        }
+    }
+
+    for (int i = 1; i < world_size; i++)
+    {
+        MPI_Send(NULL, 0, MPI_CHAR, i, TAG_STOP, MPI_COMM_WORLD);
+    }
+
+    fclose(f);
+    fclose(log);
+
+    if (total_commands > 0)
+    {
+        write_csv("output/tasks.csv", tasks, total_commands);
+        free(tasks);
+    }
+    free(waiting_commands.data);
 }

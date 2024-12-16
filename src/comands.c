@@ -1,17 +1,10 @@
-//FILE comands.c
 #include "common.h"
 #include "comands.h"
 
 int parse_command_line(const char *line, char *client_id, char *command, char *arg)
 {
-    // Example lines:
-    // "CLI0 PRIMES 10000"
-    // "WAIT 2"
-    // Return 0 on success, -1 on error
-
     if (strncmp(line, "WAIT", 4) == 0)
     {
-        // WAIT X
         strcpy(client_id, "");
         strcpy(command, "WAIT");
         int ret = sscanf(line, "WAIT %s", arg);
@@ -19,9 +12,12 @@ int parse_command_line(const char *line, char *client_id, char *command, char *a
     }
     else if (strncmp(line, "CLI", 3) == 0)
     {
-        // CLI# COMMAND ARG
-        int ret = sscanf(line, "%s %s %s", client_id, command, arg);
-        return (ret == 3) ? 0 : -1;
+        char temp[CMD_LEN];
+        int ret = sscanf(line, "%s %s %[^\n]", client_id, command, temp);
+        if (ret < 3) return -1;
+
+        strcpy(arg, temp);
+        return 0;
     }
     else
     {
