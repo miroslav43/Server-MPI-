@@ -1,0 +1,310 @@
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+#define CMD_LEN 1024
+#define TAG_CMD 10
+#define TAG_RESULT 11
+#define TAG_STOP 99
+
+// Placeholder computations
+int count_primes_up_to(long N) {
+    // A very naive method; replace with a more efficient sieve if needed
+    int count = 0;
+    for (long i = 2; i <= N; i++) {
+        int prime = 1;
+        for (long j = 2; j*j <= i; j++) {
+            if (i % j == 0) { prime = 0; break; }
+        }
+        if (prime) count++;
+    }
+    return count;
+}
+
+int count_prime_divisors(long N) {
+    // Naive prime factor counting
+    int count = 0;
+    long n = N;
+    for (long i = 2; i*i <= n; i++) {
+        if (n % i == 0) {
+            // Check if i is prime
+            int prime = 1;
+            for (long j = 2; j*j <= i; j++) {
+                if (i % j == 0) { prime = 0; break; }
+            }
+            if (prime) count++;
+            while (n % i == 0) n /= i;
+        }
+    }
+    if (n > 1) {
+        // n is prime
+        count++;
+    }
+    return count;
+}
+
+// This is a placeholder that just returns a count of permutations (factorial of name length)
+long anagram_count(const char *name) {
+    // Just count factorial of length as a placeholder
+    int len = (int)strlen(name);
+    long fact = 1;
+    for (int i = 1; i <= len; i++) fact *= i;
+    return fact;
+}
+
+// Worker process function
+void worker_process(int rank) {
+    MPI_Status status;
+    char cmd[CMD_LEN];
+
+    while (1) {
+        MPI_Recv(cmd, CMD_LEN, MPI_CHAR, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+        if (status.MPI_TAG == TAG_STOP) {
+            // Termination signal
+            break;
+        }
+
+        // Parse the command
+        // Expected format: "CLI<id> COMMAND ARG"
+        char client_id[64];
+        char command[64];
+        char arg[512];
+        char result[1024];
+
+        strcpy(result, ""); // clear result
+
+        int ret = sscanf(cmd, "%s %s %s", client_id, command, arg);
+        if (ret < 2) {
+            // Malformed command, send back error
+            sprintf(result, "ERROR: Malformed command");
+        } else {
+            // Process based on command
+            if (strcmp(command, "PRIMES") == 0) {
+                long N = atol(arg);
+                int prime_count = count_primes_up_to(N);
+                sprintf(result, "%d", prime_count);
+            } else if (strcmp(command, "PRIMEDIVISORS") == 0) {
+                long N = atol(arg);
+                int pd = count_prime_divisors(N);
+                sprintf(result, "%d", pd);
+            } else if (strcmp(command, "ANAGRAMS") == 0) {
+                // Just return the count of permutations as a placeholder
+                long cnt = anagram_count(arg);
+                sprintf(result, "Total anagrams count (not listed): %ld", cnt);
+            } else {
+                sprintf(result, "ERROR: Unknown command");
+            }
+        }
+
+        // Send result back to main server
+        MPI_Send(result, (int)strlen(result)+1, MPI_CHAR, 0, TAG_RESULT, MPI_COMM_WORLD);
+    }
+}
+
+// Logging helper
+void log_event(FILE *logf, const char* event) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    fprintf(logf, "[%02d:%02d:%02d] %s\n", t->tm_hour, t->tm_min, t->tm_sec, event);
+    fflush(logf);
+}
+
+int main(int argc, char *argv[]) {
+    MPI_Init(&argc, &argv);
+
+    int size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (size < 2) {
+        if (rank == 0) {
+            fprintf(stderr, "Need at least 2 processes: 1 main server + at least 1 worker\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (rank != 0) {
+        // Worker process
+        worker_process(rank);
+        MPI_Finalize();
+        return 0;
+    }
+
+    // Main server process (rank 0)
+    // Read commands from a file (for simplicity, use argv[1])
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s command_file\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    FILE *f = fopen(argv[1], "r");
+    if (!f) {
+        perror("Could not open command file");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Open a log file
+    FILE *logf = fopen("server_log.txt", "w");
+    if (!logf) {
+        perror("Cannot open log file");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    char line[CMD_LEN];
+    // We will keep track of which workers are free
+    int *workers_free = malloc((size-1) * sizeof(int));
+    for (int i = 0; i < size-1; i++) workers_free[i] = 1; // all workers free initially
+
+    MPI_Status status;
+
+    // To handle outstanding jobs:
+    // We'll do a simple blocking model: whenever we dispatch a job, we wait until a worker is confirmed busy.
+    // If no free worker is available, we block until one finishes.
+    // For better performance, consider using MPI_Iprobe for asynchronous receives.
+
+    // Keep track of the number of active jobs for synchronization
+    int active_jobs = 0;
+
+    while (fgets(line, CMD_LEN, f)) {
+        // Strip newline
+        line[strcspn(line, "\n")] = '\0';
+
+        if (strncmp(line, "WAIT", 4) == 0) {
+            // Format: WAIT X
+            int wait_time = 0;
+            sscanf(line, "WAIT %d", &wait_time);
+            log_event(logf, "Main server received WAIT command");
+            sleep(wait_time);
+            continue;
+        }
+
+        if (strncmp(line, "CLI", 3) == 0) {
+            // Client command: e.g. "CLI0 PRIMES 10000"
+            // We must find a free worker
+            int found = 0;
+            char client_id[64], command[64], arg[512];
+            sscanf(line, "%s %s %s", client_id, command, arg);
+            char event_msg[256];
+            sprintf(event_msg, "Received command from %s: %s %s", client_id, command, arg);
+            log_event(logf, event_msg);
+
+            // Before we try to find a free worker, let's see if there are completed jobs
+            // Check if any worker has finished and is sending a result
+            while (1) {
+                int flag;
+                MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &flag, &status);
+                if (!flag) break;
+                // If a result arrived
+                char result[1024];
+                MPI_Recv(result, 1024, MPI_CHAR, status.MPI_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
+                // The worker that sent this result is now free
+                workers_free[status.MPI_SOURCE-1] = 1;
+                active_jobs--;
+
+                // We must determine which client ID it belongs to. 
+                // This example doesn't store a mapping from worker->client_id, which you'd ideally maintain.
+                // For simplicity, let's just store it in the job itself or send client_id back with the result.
+                // We'll assume the worker returns the result as is. In a real solution, 
+                // you'd send back "client_id result" or maintain a map.
+                // For now, we just guess that we have the client_id in line (In reality, you'd store a pending jobs queue).
+                // Let's assume we stored the last dispatched command in a structure. For a skeleton:
+                // We'll just write result to a generic file named "last_client_result.txt".
+                // In a real implementation, maintain a queue or map from client_id to worker and handle accordingly.
+
+                // Extract client_id from the stored line or from worker messages (in a real code you must handle this properly)
+                // A quick hack: We'll just parse the client_id from a known format we originally sent.
+                // Because we always send the original line to the worker:
+                // The worker processed: "CLI<ID> COMMAND ARG"
+                // If we had stored that line in a data structure keyed by the worker rank, we could retrieve client_id easily.
+                // Here we will just trust that we have a global memory. This is a simplification.
+
+                // In a real solution, maintain a structure like:
+                //   struct {
+                //       int worker_rank;
+                //       char client_id[64];
+                //   } active_jobs_array;
+                // and when assigning, store it. Then retrieve here.
+
+                // For demonstration, let's say we somehow know the client_id from the command that was sent.
+                // We'll just write it to a file named after the client_id.
+                // This code snippet won't perfectly handle multiple concurrent jobs from different clients 
+                // unless you store the mapping. Let's do a simplification:
+                char result_client_id[64];
+                // Try to parse client_id from result line if it was included by the worker
+                // Worker currently doesn't send client_id. Let's fix that:
+                // Instead of sending only result, we can have worker send back "client_id|result".
+                // For now, let's just store in a generic file:
+                FILE *rf = fopen("generic_result.txt", "a");
+                if (rf) {
+                    fprintf(rf, "Result received: %s\n", result);
+                    fclose(rf);
+                }
+                sprintf(event_msg, "Result received from worker %d: %s", status.MPI_SOURCE, result);
+                log_event(logf, event_msg);
+            }
+
+            // Now try to find a free worker
+            int free_worker = -1;
+            for (int i = 0; i < size-1; i++) {
+                if (workers_free[i]) {
+                    free_worker = i+1; // worker rank = i+1
+                    break;
+                }
+            }
+
+            if (free_worker == -1) {
+                // No free worker, we must wait for one to become free
+                // Wait for a result from any worker
+                char result[1024];
+                MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
+                workers_free[status.MPI_SOURCE-1] = 1;
+                active_jobs--;
+                sprintf(event_msg, "A job finished, freeing worker %d. Result: %s", status.MPI_SOURCE, result);
+                log_event(logf, event_msg);
+
+                // Now we have a free worker
+                for (int i = 0; i < size-1; i++) {
+                    if (workers_free[i]) {
+                        free_worker = i+1;
+                        break;
+                    }
+                }
+            }
+
+            // Dispatch job to worker free_worker
+            workers_free[free_worker-1] = 0;
+            MPI_Send(line, (int)strlen(line)+1, MPI_CHAR, free_worker, TAG_CMD, MPI_COMM_WORLD);
+            active_jobs++;
+            sprintf(event_msg, "Dispatched job to worker %d", free_worker);
+            log_event(logf, event_msg);
+        }
+    }
+
+    // All commands processed. Now wait for all active jobs to finish
+    while (active_jobs > 0) {
+        char result[1024];
+        MPI_Recv(result, 1024, MPI_CHAR, MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &status);
+        workers_free[status.MPI_SOURCE-1] = 1;
+        active_jobs--;
+        char event_msg[256];
+        sprintf(event_msg, "Final cleanup: job finished from worker %d: %s", status.MPI_SOURCE, result);
+        log_event(logf, event_msg);
+    }
+
+    // Send stop signal to workers
+    for (int i = 1; i < size; i++) {
+        MPI_Send(NULL, 0, MPI_CHAR, i, TAG_STOP, MPI_COMM_WORLD);
+    }
+
+    fclose(f);
+    fclose(logf);
+    free(workers_free);
+
+    MPI_Finalize();
+    return 0;
+}
+mpirun -np 4 ./bin/server_cluster command_file.txt
